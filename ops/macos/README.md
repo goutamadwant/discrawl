@@ -4,7 +4,7 @@ launchd runs Discrawl directly. Discrawl loads both credentials, owns the archiv
 writer, captures Gateway events, repairs history, and processes embeddings.
 There is no Python coordinator or credential-loading shell wrapper.
 
-The installed application is `e6c7c2fff74572b23bd2f1d6872c5e197ba4c769`
+The ingestion-integrity baseline is `e6c7c2fff74572b23bd2f1d6872c5e197ba4c769`
 (`0.15.1-21-ge6c7c2f`), with Crawlkit v0.16.3 and schema 7. It includes the
 member-change index and the [ingestion integrity repair](../../docs/guides/ingestion-integrity.md):
 persisted ancestry exclusions, attributed rich text, recovery snapshots,
@@ -13,7 +13,7 @@ retains the existing identity, message configuration, schedule and writer
 ownership. Machine-specific service and signing files remain on this operations
 branch.
 
-Activated at `2026-09-26T01:33:54Z`; SHA-256:
+That baseline was activated at `2026-09-26T01:33:54Z`; SHA-256:
 `11662da58ad262e1e028c738d1fdb3509cb89dacfc3a3d308fe14d01fe77e46f`.
 The bounded local text pass completed without resetting ingestion cursors or
 fetching historical attachments. Its checkpoint survives restarts. Existing raw
@@ -26,11 +26,36 @@ targets come only from `~/.config/discrawl/metrics.json`, which contains the
 OpenClaw `clawd` invite target. The message collector does not own that schedule
 or replace the metrics executable.
 
+## Durable writer activation — October 11, 2026
+
+The archive runtime now uses commit `7570e144f0bbee993829d27fd1ebaaffe1757d7c`
+(`0.15.1-21-ge6c7c2f-durability-7570e14`), activated at `2026-10-11T21:31:23Z`.
+Its SHA-256 is `49360be4fda6c36860e1e1ea9bb06bfb8037fd728502a21dc871f5423b322009`.
+The standalone metrics runtime uses commit `6b59fbec53113f11d4cfd68bfee48ed06c838580`
+at `~/.local/libexec/discrawl-metrics/6b59fbec53113f11d4cfd68bfee48ed06c838580/discrawl`.
+Only that job's executable argument changed; its hourly minute-4 schedule and
+RunAtLoad policy are unchanged. Previous executables and the original metrics
+plist remain preserved in the private deployment receipts.
+
+Every archive/metrics writer connection, including pool replacements, now uses
+FULL synchronization and macOS full-sync/checkpoint-full-sync requests. Read-only
+connections are unchanged. See [SQLite durability](../../docs/guides/sqlite-durability.md).
+The existing certificate-bound application identity remains intact. Schema 7,
+credentials, source history and cursors are unchanged; the proposed capture
+migration remains on HOLD and is absent from both installed build inputs.
+
+Connection/replacement race tests, native archive WAL interruption/reopen tests,
+and interrupted metrics import/replay passed. Initial archive and metrics
+collection after activation succeeded. Windows path tests were cross-compiled;
+no Windows runtime or physical power-cut test was performed. OS/device flush
+honesty remains a durability limit. Validation and activation receipts are in
+`~/.local/share/discrawl/durability-20261011-5ico7n5l/`.
+
 ## Installed configuration
 
-- Executable: `/Volumes/Data/Projects/openclaw-tools/releases/discrawl/stable/discrawl`,
-  a signed regular file at a stable path across rebuilds. CLI links point here.
-- Config: `/Volumes/Data/AppData/discrawl/config.toml`.
+- Executable: `/Users/hrudolph/Projects/openclaw-tools/releases/discrawl/stable/discrawl`,
+  a signed regular file at a stable path across rebuilds. LaunchAgents invoke this path directly.
+- Config: `/Users/hrudolph/Data/AppData/discrawl/config.toml`.
 - `com.hrudolph.discrawl-tail` runs `tail --guilds 1456350064065904867 --repair-every 6h --repair-on-start --embed-live` under launchd.
 - `com.hrudolph.discrawl-status` records native JSON status hourly.
 - `com.hrudolph.discrawl-logrotate` runs standard logrotate every 15 minutes.
@@ -57,7 +82,7 @@ remains recoverable on restart.
 Native status is the source of truth:
 
 ```sh
-discrawl --config /Volumes/Data/AppData/discrawl/config.toml --json status
+discrawl --config /Users/hrudolph/Data/AppData/discrawl/config.toml --json status
 launchctl print gui/$(id -u)/com.hrudolph.discrawl-tail
 ```
 
