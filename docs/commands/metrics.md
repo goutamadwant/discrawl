@@ -185,3 +185,19 @@ their own observations even when counts do not change.
 
 - [`analytics`](analytics.html) for activity calculated from archived messages.
 - [Data storage](../guides/data-storage.html).
+
+## Local durable-writer deployment
+
+The standalone metrics deployment now uses source commit
+`6b59fbec53113f11d4cfd68bfee48ed06c838580`. Its private versioned executable is
+`~/.local/libexec/discrawl-metrics/6b59fbec53113f11d4cfd68bfee48ed06c838580/discrawl`.
+The existing configuration/database and hourly minute-4 schedule are unchanged;
+only the LaunchAgent executable path changed. The ordinary RunAtLoad collection
+at `2026-10-11T21:31:23.893746Z` completed with status `ok` and two observations.
+
+Writable connections now use FULL synchronization, plus fullfsync and
+checkpoint_fullfsync on macOS, including pool replacements. Read-only ownership
+checks and status remain unchanged. A disposable interrupted import preserved
+500 committed rows; replay of 900 fixture rows added exactly 400, with no
+logical duplicates and integrity_check=ok. This tests process interruption,
+not physical power loss. See [SQLite durability](../guides/sqlite-durability.md).
