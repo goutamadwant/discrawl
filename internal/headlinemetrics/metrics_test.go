@@ -118,8 +118,12 @@ func TestOpenRejectsDanglingDatabaseSymlink(t *testing.T) {
 }
 
 func TestConcurrentWritesUseNativeSQLiteLock(t *testing.T) {
-	first := newMetrics(t)
-	second, err := Open(t.Context(), first.Path(), "discrawl")
+	path := filepath.Join(t.TempDir(), "metrics.sqlite")
+	first, err := Open(t.Context(), path, "discrawl")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, first.Close()) })
+	// Store.Path is the private writer URI; public config retains the filename.
+	second, err := Open(t.Context(), path, "discrawl")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, second.Close()) })
 	tx, err := first.DB().BeginTx(t.Context(), nil)
