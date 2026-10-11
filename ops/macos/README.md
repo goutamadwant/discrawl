@@ -82,7 +82,7 @@ remains recoverable on restart.
 Native status is the source of truth:
 
 ```sh
-discrawl --config /Users/hrudolph/Data/AppData/discrawl/config.toml --json status
+DISCRAWL_NO_AUTO_UPDATE=1 /Users/hrudolph/Projects/openclaw-tools/releases/discrawl/stable/discrawl --config /Users/hrudolph/Data/AppData/discrawl/config.toml --json status
 launchctl print gui/$(id -u)/com.hrudolph.discrawl-tail
 ```
 
