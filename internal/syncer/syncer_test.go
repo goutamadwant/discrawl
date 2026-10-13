@@ -518,7 +518,7 @@ func TestSyncRejectsUnknownRequestedGuild(t *testing.T) {
 	require.Empty(t, lastSync)
 }
 
-func TestSyncSkipsMemberRefreshWhenExistingSnapshotPresent(t *testing.T) {
+func TestSyncRefreshesExistingRowsWithoutCompletionReceipt(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -562,7 +562,7 @@ func TestSyncSkipsMemberRefreshWhenExistingSnapshotPresent(t *testing.T) {
 	stats, err := svc.Sync(ctx, SyncOptions{Full: true})
 	require.NoError(t, err)
 	require.Equal(t, 0, stats.Members)
-	require.Zero(t, client.memberCalls)
+	require.Equal(t, 1, client.memberCalls)
 
 	lastSuccess, err := s.GetSyncState(ctx, guildMemberSyncSuccessScope("g1"))
 	require.NoError(t, err)
