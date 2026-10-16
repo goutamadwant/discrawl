@@ -41,7 +41,7 @@ func effectiveMessageGuildID(message *discordgo.Message, fallbackGuildID string)
 }
 
 func toMessageRecord(message *discordgo.Message, channelName, guildID, normalizedContent string) store.MessageRecord {
-	raw := marshalJSONString(message, "{}")
+	raw := marshalMessageJSON(message)
 	authorID := ""
 	authorName := ""
 	if message.Author != nil {
@@ -84,6 +84,15 @@ func marshalJSONString(value any, fallback string) string {
 		return fallback
 	}
 	return string(raw)
+}
+
+// discordgo decodes Components but marks the field json:"-". Keep that tree
+// when storing provider evidence, including Components V2 message bodies.
+func marshalMessageJSON(message *discordgo.Message) string {
+	return marshalJSONString(struct {
+		*discordgo.Message
+		Components []discordgo.MessageComponent `json:"components,omitempty"`
+	}{message, message.Components}, "{}")
 }
 
 func normalizeMessage(message *discordgo.Message) string {

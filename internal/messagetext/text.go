@@ -35,6 +35,9 @@ func Parts(m *discordgo.Message, attachments []Attachment) []Part {
 		return parts
 	}
 	add("authored", "/content", m.Content)
+	if m.Flags&discordgo.MessageFlagsIsComponentsV2 != 0 {
+		parts = appendComponentParts(parts, m.Components, "/components")
+	}
 	if attachments == nil {
 		for _, a := range m.Attachments {
 			if a != nil {
@@ -82,6 +85,58 @@ func Parts(m *discordgo.Message, attachments []Attachment) []Part {
 			if a.Media != nil {
 				add("poll_answer", fmt.Sprintf("/poll/answers/%d/poll_media/text", i), a.Media.Text)
 			}
+		}
+	}
+	return parts
+}
+
+func appendComponentParts(parts []Part, components []discordgo.MessageComponent, path string) []Part {
+	for i, component := range components {
+		parts = appendComponentPart(parts, component, fmt.Sprintf("%s/%d", path, i))
+	}
+	return parts
+}
+
+func appendComponentPart(parts []Part, component discordgo.MessageComponent, path string) []Part {
+	add := func(kind, field, text string) {
+		if text != "" {
+			parts = append(parts, Part{Kind: kind, Path: path + field, Text: text})
+		}
+	}
+	switch c := component.(type) {
+	case *discordgo.TextDisplay:
+		if c != nil {
+			add("component_text", "/content", c.Content)
+		}
+	case *discordgo.Button:
+		if c != nil {
+			add("component_label", "/label", c.Label)
+			add("component_url", "/url", c.URL)
+		}
+	case *discordgo.Thumbnail:
+		if c != nil && c.Description != nil {
+			add("component_description", "/description", *c.Description)
+		}
+	case *discordgo.MediaGallery:
+		if c != nil {
+			for i, item := range c.Items {
+				if item.Description != nil {
+					add("component_description", fmt.Sprintf("/items/%d/description", i), *item.Description)
+				}
+			}
+		}
+	case *discordgo.Section:
+		if c != nil {
+			parts = appendComponentParts(parts, c.Components, path+"/components")
+			parts = appendComponentPart(parts, c.Accessory, path+"/accessory")
+		}
+	case *discordgo.Container:
+		if c != nil {
+			parts = appendComponentParts(parts, c.Components, path+"/components")
+		}
+	case *discordgo.ActionsRow:
+		if c != nil {
+			parts = appendComponentParts(parts, c.Components, path+"/components")
 		}
 	}
 	return parts

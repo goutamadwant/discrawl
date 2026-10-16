@@ -635,6 +635,7 @@ func (s *Syncer) bootstrapChannelHistory(ctx context.Context, channel *discordgo
 	before := ""
 	newest := ""
 	for {
+		observedAt := time.Now()
 		page, err := s.client.ChannelMessages(ctx, channel.ID, 100, before, "")
 		if err != nil {
 			return messageCount, err
@@ -643,7 +644,7 @@ func (s *Syncer) bootstrapChannelHistory(ctx context.Context, channel *discordgo
 			break
 		}
 		eligible, reachedSince := filterMessagesSince(page, since)
-		pageNewest, err := s.persistMessagePage(ctx, eligible, channel.Name, channel.GuildID, embeddings)
+		pageNewest, err := s.persistMessagePage(ctx, eligible, channel.Name, channel.GuildID, embeddings, observedAt)
 		if err != nil {
 			return messageCount, err
 		}
@@ -688,6 +689,7 @@ func (s *Syncer) syncForwardPages(ctx context.Context, channel *discordgo.Channe
 	messageCount := 0
 	newest := after
 	for {
+		observedAt := time.Now()
 		page, err := s.client.ChannelMessages(ctx, channel.ID, 100, "", after)
 		if err != nil {
 			return messageCount, newest, err
@@ -695,7 +697,7 @@ func (s *Syncer) syncForwardPages(ctx context.Context, channel *discordgo.Channe
 		if len(page) == 0 {
 			break
 		}
-		pageNewest, err := s.persistMessagePage(ctx, page, channel.Name, channel.GuildID, embeddings)
+		pageNewest, err := s.persistMessagePage(ctx, page, channel.Name, channel.GuildID, embeddings, observedAt)
 		if err != nil {
 			return messageCount, newest, err
 		}
@@ -725,6 +727,7 @@ func (s *Syncer) syncBackfillPages(ctx context.Context, channel *discordgo.Chann
 	newest := ""
 	pages := 0
 	for {
+		observedAt := time.Now()
 		page, err := s.client.ChannelMessages(ctx, channel.ID, 100, before, "")
 		if err != nil {
 			return messageCount, newest, err
@@ -736,7 +739,7 @@ func (s *Syncer) syncBackfillPages(ctx context.Context, channel *discordgo.Chann
 			break
 		}
 		eligible, reachedSince := filterMessagesSince(page, since)
-		pageNewest, err := s.persistMessagePage(ctx, eligible, channelName, channel.GuildID, embeddings)
+		pageNewest, err := s.persistMessagePage(ctx, eligible, channelName, channel.GuildID, embeddings, observedAt)
 		if err != nil {
 			return messageCount, newest, err
 		}
@@ -800,7 +803,7 @@ func (s *Syncer) advanceChannelLatest(ctx context.Context, channelID, cursor str
 	return s.store.AdvanceChannelLatestMessageID(ctx, channelID, cursor)
 }
 
-func (s *Syncer) persistMessagePage(ctx context.Context, messages []*discordgo.Message, channelName string, fallbackGuildID string, embeddings bool) (string, error) {
+func (s *Syncer) persistMessagePage(ctx context.Context, messages []*discordgo.Message, channelName string, fallbackGuildID string, embeddings bool, observedAt time.Time) (string, error) {
 	if len(messages) == 0 {
 		return "", nil
 	}
@@ -808,8 +811,10 @@ func (s *Syncer) persistMessagePage(ctx context.Context, messages []*discordgo.M
 	if err != nil {
 		return "", err
 	}
-	if s.channelExclusions.configured() {
-		for i := range mutations {
+	for i := range mutations {
+		mutations[i].Options.PreserveNewer = true
+		mutations[i].Options.ObservationStartedAt = observedAt
+		if s.channelExclusions.configured() {
 			mutations[i].Options.ScopePolicy = s.channelExclusions.policyID()
 		}
 	}
