@@ -727,18 +727,19 @@ def acquisition_since(value=None):
     return value
 
 
-def acquire(native, config, policy_path, expected_sha256, guild, completion, timeout=1200, since=None):
+def acquire(native, config, policy_path, expected_sha256, guild, completion, timeout=1200, since=None, with_members=False):
     require(policy_path.is_file() and not policy_path.is_symlink()
             and policy_path.stat().st_size <= MAX_POLICY, "policy_file")
     _, targets = validate_policy(policy_path.read_bytes(), expected_sha256, guild)
     require(0 < timeout <= 1200, "writer_arguments")
     since = acquisition_since(since)
-    base = [str(native), "--config", str(config), "sync", "--source", "discord", "--guild", guild,
-            "--skip-members", "--no-update"]
+    base = [str(native), "--config", str(config), "sync", "--source", "discord", "--guild", guild, "--no-update"]
     # General archive refresh remains first; report roots only scope the extra
     # bounded scan. Native forum expansion and report privacy keep their owners.
-    commands = [[*base, "--latest-only"],
-                [*base, "--full", "--since", since, "--channels", ",".join(targets), "--with-media=false"]]
+    # Required member refresh belongs to the guild pass; targeted sync rejects it.
+    commands = [[*base, "--latest-only", "--with-members" if with_members else "--skip-members"],
+                [*base, "--skip-members", "--full", "--since", since, "--channels", ",".join(targets),
+                 "--include-stored-threads", "--with-media=false"]]
     return run_writers(commands, timeout, completion)
 
 
@@ -815,7 +816,7 @@ def run_writers(commands, timeout, completion=None):
 
 def main():
     os.umask(0o077)
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, epilog="acquire also accepts --with-members for its guild refresh.")
     parser.add_argument("operation", choices=("restore", "save", "migrate", "run", "report-check", "policy", "acquire"))
     parser.add_argument("--db", type=Path)
     parser.add_argument("--receipt", type=Path)
@@ -833,7 +834,10 @@ def main():
     args, command = parser.parse_known_args()
     if args.operation == "run":
         return run_writer(command[1:] if command[:1] == ["--"] else command, args.timeout if args.timeout is not None else 2700, args.writer_receipt)
-    require(not command, "arguments")
+    # Keep this acquisition-only flag out of the common parser: run forwards
+    # the same native flag, including commands without a -- separator.
+    with_members = args.operation == "acquire" and command == ["--with-members"]
+    require(not command or with_members, "arguments")
     if args.operation in {"policy", "acquire"}:
         execution_context()
         require(args.policy is not None, "arguments")
@@ -845,7 +849,7 @@ def main():
             return 0
         require(args.native is not None and args.config is not None and args.writer_receipt is not None, "arguments")
         return acquire(args.native, args.config, args.policy, args.policy_sha256, guild, args.writer_receipt,
-                       args.timeout if args.timeout is not None else 2700, args.since)
+                       args.timeout if args.timeout is not None else 2700, args.since, with_members)
     if args.operation == "report-check":
         require(args.receipt is not None and args.archive is not None, "arguments")
         return 0 if report_ready(args.receipt, args.archive) else 3

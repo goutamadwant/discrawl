@@ -76,17 +76,17 @@ promise a fifteen-minute completion time or durable FIFO scheduling.
 
 ## Private bounded acquisition
 
-The publisher currently has **only a manual trigger**. Keep it disabled until
-the full-state migration is verified. Enabling it later permits a measured
-manual run without also starting a cron schedule. Recurring acquisition and the
-daily member refresh need a later reviewed cadence change, based on measured
-restore, acquisition, checkpoint and publication durations.
+The publisher is manual-only while full-state custody and measured restore,
+acquisition, checkpoint and publication behavior are qualified. Automatic cadence,
+including the daily member refresh, requires a separate reviewed activation.
+Its frequency must fit those measured durations; concurrency does not provide durable FIFO.
 
-Each manual run requires `policy_commit` and `policy_sha256`. The existing
+The workflow pins `POLICY_COMMIT` and `POLICY_SHA256` once for acquisition.
+Changing acquisition scope requires a reviewed source change. The existing
 backup credential reads `policy/report-selectors.json` from the private backup
 repository. Its `refs/heads/maintainer-report-policy` must point to exactly the
-requested commit; the file is then fetched by that commit and its bytes must
-match the requested SHA-256. A missing, changed or invalid policy stops before
+pinned commit; the file is then fetched by that commit and its bytes must
+match the pinned SHA-256. A missing, changed or invalid policy stops before
 native state is restored. No policy branch, repository variable or credential
 is created by the workflow.
 
@@ -100,8 +100,9 @@ The policy is a JSON object with these exact fields:
 - `guild_id`: the exact configured Discord guild ID.
 - `message_root_ids` and `forum_root_ids`: arrays of native decimal IDs.
 - `retained_threads`: objects with `id` and `parent_id`; each parent must be one
-  of the declared message or forum roots. Retained children of text roots must
-  be explicit targets: native targeted discovery expands forum children only.
+  of the declared message or forum roots. These pin existing leaves. Ordinary
+  `--channels` selection expands forum children; acquisition also includes stored
+  direct text and announcement-root children discovered by its first pass.
 
 The approved policy digest binds that provenance and scope together. The file
 is limited to 64 KiB and 4,096 distinct targets in total. It cannot contain
@@ -111,11 +112,18 @@ archive `main`, in SQLite, or in public workflow inputs, logs or artifacts. The
 workflow keeps its temporary copy private and outside all export paths.
 
 The supervisor first runs the existing guild-wide latest-only refresh. It then
-runs native `sync --full --since` on the policy targets, starting at the previous
+runs native `sync --full --since --include-stored-threads` on the policy targets,
+including stored direct threads of selected text and announcement roots. This
+keeps threads discovered by the first pass in the bounded coverage scan without
+rewriting the policy. Selected thread leaves do not expand to siblings or descendants.
+The scan starts at the previous
 UTC midnight by default. An optional `since` input may pin a UTC midnight less
 than 48 hours ago. It is fixed before restore and revalidated before acquisition;
 a stale or future value stops rather than silently selecting a different day.
-The second phase uses `--skip-members`, `--with-media=false` and `--no-update`.
+The prepared daily 06:17 UTC route requires a member refresh in the first guild-wide
+phase; its cron is not enabled. Manual runs skip members. A required member-refresh failure stops before
+the targeted phase. The second phase always uses `--skip-members`,
+`--with-media=false` and `--no-update`.
 Both phases share the same 1,200-second deadline, and the second
 starts only after the first process group has exited. Any failure prevents Git
 publication; committed partial work can still enter a verified private

@@ -321,6 +321,22 @@ class CheckpointTests(unittest.TestCase):
         self.assertEqual(result.returncode, 9)
         self.assertNotIn(b"private data", result.stdout + result.stderr)
 
+    def test_run_forwards_member_flags_unchanged_with_or_without_separator(self):
+        native = self.root / "native"
+        observed = self.root / "native-arguments.json"
+        native.write_text("#!" + sys.executable + "\nimport json,sys\nfrom pathlib import Path\n"
+                          "Path(%r).write_text(json.dumps(sys.argv[1:]))\n"
+                          "raise SystemExit(9 if '--with-members' in sys.argv and '--skip-members' in sys.argv else 0)\n"
+                          % str(observed))
+        native.chmod(0o700)
+        for separator in [[], ["--"]]:
+            for flags in [["--with-members"], ["--skip-members", "--with-members"]]:
+                with self.subTest(separator=separator, flags=flags):
+                    result = subprocess.run([sys.executable, str(SCRIPT), "run", "--timeout", "2",
+                                             *separator, str(native), "sync", *flags], capture_output=True)
+                    self.assertEqual(json.loads(observed.read_bytes()), ["sync", *flags])
+                    self.assertEqual(result.returncode, 9 if len(flags) == 2 else 0)
+
     def test_unknown_descendant_reap_never_authorizes_snapshot(self):
         completion = self.root / "writer.json"
         real_kill = os.killpg
@@ -524,12 +540,14 @@ class AcquisitionPolicyTests(unittest.TestCase):
              patch.object(checkpoint, "load_policy"), patch("sys.stdout", new_callable=io.StringIO) as out:
             self.assertEqual(checkpoint.main(), 0)
             self.assertEqual(out.getvalue(), "since=" + frozen + "\n")
-        with patch.object(sys, "argv", ["checkpoint", "acquire", "--policy", str(self.path),
-                                       "--policy-sha256", "f" * 64, "--native", "/native", "--config", "/config",
-                                       "--writer-receipt", "/receipt", "--timeout", "1200", "--since", frozen]), \
-             patch.object(checkpoint, "execution_context"), patch.object(checkpoint, "acquire", return_value=0) as run:
-            self.assertEqual(checkpoint.main(), 0)
-            self.assertEqual(run.call_args.args[-2:], (1200, frozen))
+        for flags in [[], ["--with-members"]]:
+            with self.subTest(flags=flags), \
+                 patch.object(sys, "argv", ["checkpoint", "acquire", "--policy", str(self.path),
+                                           "--policy-sha256", "f" * 64, "--native", "/native", "--config", "/config",
+                                           "--writer-receipt", "/receipt", "--timeout", "1200", "--since", frozen, *flags]), \
+                 patch.object(checkpoint, "execution_context"), patch.object(checkpoint, "acquire", return_value=0) as run:
+                self.assertEqual(checkpoint.main(), 0)
+                self.assertEqual(run.call_args.args[-3:], (1200, frozen, bool(flags)))
 
     def test_acquisition_keeps_general_refresh_and_uses_previous_utc_midnight(self):
         raw = checkpoint.canonical(self.policy)
@@ -545,15 +563,56 @@ class AcquisitionPolicyTests(unittest.TestCase):
         self.assertEqual((timeout, receipt), (1200, Path("/receipt")))
         self.assertIn("--latest-only", commands[0])
         self.assertNotIn("--channels", commands[0])
+        self.assertNotIn("--include-stored-threads", commands[0])
         self.assertEqual(commands[1][commands[1].index("--since")+1], "2026-01-02T00:00:00Z")
         self.assertEqual(commands[1][commands[1].index("--channels")+1], "11,12,13")
         self.assertIn("--full", commands[1])
+        self.assertIn("--include-stored-threads", commands[1])
         for command in commands:
             self.assertIn("--no-update", command)
+            self.assertIn("--skip-members", command)
+            self.assertNotIn("--with-members", command)
             self.assertNotIn("--all", command)
             self.assertNotIn("cloud", command)
         with self.assertRaisesRegex(checkpoint.CheckpointError, "policy_checksum"):
             checkpoint.acquire(Path("/native"), Path("/config"), self.path, "f" * 64, "100", Path("/receipt"))
+
+    def test_daily_member_refresh_belongs_only_to_first_phase_with_shared_budget(self):
+        raw = checkpoint.canonical(self.policy)
+        self.path.write_bytes(raw)
+        with patch.object(checkpoint, "run_writers", return_value=0) as run:
+            result = checkpoint.acquire(Path("/native"), Path("/config"), self.path, checkpoint.digest(raw),
+                                        "100", Path("/receipt"), with_members=True)
+        self.assertEqual(result, 0)
+        run.assert_called_once()
+        commands, timeout, receipt = run.call_args.args
+        self.assertEqual((len(commands), timeout, receipt), (2, 1200, Path("/receipt")))
+        self.assertIn("--latest-only", commands[0])
+        self.assertIn("--with-members", commands[0])
+        self.assertNotIn("--skip-members", commands[0])
+        self.assertNotIn("--channels", commands[0])
+        self.assertNotIn("--include-stored-threads", commands[0])
+        self.assertIn("--full", commands[1])
+        self.assertIn("--include-stored-threads", commands[1])
+        self.assertIn("--skip-members", commands[1])
+        self.assertNotIn("--with-members", commands[1])
+
+    def test_required_member_failure_is_reaped_and_never_starts_targeted_phase(self):
+        raw = checkpoint.canonical(self.policy)
+        self.path.write_bytes(raw)
+        native = Path(self.temp.name) / "native"
+        calls = Path(self.temp.name) / "calls.json"
+        native.write_text("#!" + sys.executable + "\nimport json,sys\nfrom pathlib import Path\n"
+                          "p=Path(%r)\np.write_text(json.dumps(sys.argv[1:]))\n"
+                          "raise SystemExit(7 if '--with-members' in sys.argv else 0)\n" % str(calls))
+        native.chmod(0o700)
+        completion = Path(self.temp.name) / "writer.json"
+        result = checkpoint.acquire(native, Path("/config"), self.path, checkpoint.digest(raw),
+                                    "100", completion, timeout=3, with_members=True)
+        self.assertEqual(result, 7)
+        self.assertIn("--with-members", json.loads(calls.read_bytes()))
+        self.assertNotIn("--channels", json.loads(calls.read_bytes()))
+        self.assertEqual(json.loads(completion.read_bytes()), {"reaped": True, "outcome": "failure"})
 
 
 if __name__ == "__main__":
