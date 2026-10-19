@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Refresh the OpenAI SDK, YAML parser, and Go telemetry dependencies while preserving the Go minimum and SQLite/libc compatibility pins.
+
 - Add a manual, selected-stream historical backfill mode with an explicit UTC-midnight bound less than 31 days old, retaining the ordinary 48-hour window and shared acquisition deadline.
 
 - Move native and Kiwi macOS CI to Xcode 27, preserve the macOS 13 deployment target, and verify Intel release binaries explicitly through Rosetta.
