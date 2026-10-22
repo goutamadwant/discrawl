@@ -318,17 +318,24 @@ func (s *Syncer) verifyChannelHistory(ctx context.Context, channel *discordgo.Ch
 		return 0, err
 	}
 	if err := s.store.DeleteSyncState(ctx, channelHistoryCompleteScope(channel.ID)); err != nil {
-		return 0, err
+		// Cancellation can be reported after a durable commit already removed
+		// the marker. Restoration is idempotent and only re-marks an empty
+		// channel, so attempt it whenever clearing reports failure.
+		return 0, s.restoreAfterFailedVerification(ctx, channel.ID, err)
 	}
 	count, err := s.syncFullChannelHistory(ctx, channel, state, embeddings, time.Time{}, checkpoint, progress)
 	if err != nil {
-		// Reuse the detached failure-state budget so cancellation cannot
-		// suppress restoration or leave it waiting indefinitely for the store.
-		restoreCtx, cancel := failureLedgerContext(ctx)
-		defer cancel()
-		return count, errors.Join(err, s.restoreHistoryCompleteAfterFailedVerification(restoreCtx, channel.ID))
+		return count, s.restoreAfterFailedVerification(ctx, channel.ID, err)
 	}
 	return count, s.recordVerifiedEmptyChannel(ctx, channel.ID)
+}
+
+// restoreAfterFailedVerification reuses the detached failure-state budget so
+// cancellation cannot suppress restoration or leave it waiting indefinitely.
+func (s *Syncer) restoreAfterFailedVerification(ctx context.Context, channelID string, failure error) error {
+	restoreCtx, cancel := failureLedgerContext(ctx)
+	defer cancel()
+	return errors.Join(failure, s.restoreHistoryCompleteAfterFailedVerification(restoreCtx, channelID))
 }
 
 // restoreHistoryCompleteAfterFailedVerification puts history_complete back when
@@ -638,6 +645,10 @@ func (s *Syncer) bootstrapChannelHistory(ctx context.Context, channel *discordgo
 	before := ""
 	newest := ""
 	for {
+		observedAt := time.Now()
+		if err := s.requirePersistedScope(ctx, channel.ID); err != nil {
+			return messageCount, err
+		}
 		page, err := s.client.ChannelMessages(ctx, channel.ID, 100, before, "")
 		if err != nil {
 			return messageCount, err
@@ -646,7 +657,7 @@ func (s *Syncer) bootstrapChannelHistory(ctx context.Context, channel *discordgo
 			break
 		}
 		eligible, reachedSince := filterMessagesSince(page, since)
-		pageNewest, err := s.persistMessagePage(ctx, eligible, channel.Name, channel.GuildID, embeddings)
+		pageNewest, err := s.persistMessagePage(ctx, eligible, channel.Name, channel.GuildID, embeddings, observedAt)
 		if err != nil {
 			return messageCount, err
 		}
@@ -691,6 +702,10 @@ func (s *Syncer) syncForwardPages(ctx context.Context, channel *discordgo.Channe
 	messageCount := 0
 	newest := after
 	for {
+		observedAt := time.Now()
+		if err := s.requirePersistedScope(ctx, channel.ID); err != nil {
+			return messageCount, newest, err
+		}
 		page, err := s.client.ChannelMessages(ctx, channel.ID, 100, "", after)
 		if err != nil {
 			return messageCount, newest, err
@@ -698,7 +713,7 @@ func (s *Syncer) syncForwardPages(ctx context.Context, channel *discordgo.Channe
 		if len(page) == 0 {
 			break
 		}
-		pageNewest, err := s.persistMessagePage(ctx, page, channel.Name, channel.GuildID, embeddings)
+		pageNewest, err := s.persistMessagePage(ctx, page, channel.Name, channel.GuildID, embeddings, observedAt)
 		if err != nil {
 			return messageCount, newest, err
 		}
@@ -728,6 +743,10 @@ func (s *Syncer) syncBackfillPages(ctx context.Context, channel *discordgo.Chann
 	newest := ""
 	pages := 0
 	for {
+		observedAt := time.Now()
+		if err := s.requirePersistedScope(ctx, channel.ID); err != nil {
+			return messageCount, newest, err
+		}
 		page, err := s.client.ChannelMessages(ctx, channel.ID, 100, before, "")
 		if err != nil {
 			return messageCount, newest, err
@@ -741,7 +760,7 @@ func (s *Syncer) syncBackfillPages(ctx context.Context, channel *discordgo.Chann
 			break
 		}
 		eligible, reachedSince := filterMessagesSince(page, since)
-		pageNewest, err := s.persistMessagePage(ctx, eligible, channelName, channel.GuildID, embeddings)
+		pageNewest, err := s.persistMessagePage(ctx, eligible, channelName, channel.GuildID, embeddings, observedAt)
 		if err != nil {
 			return messageCount, newest, err
 		}
@@ -815,13 +834,26 @@ func (s *Syncer) advanceChannelLatest(ctx context.Context, channelID, cursor str
 	return s.store.AdvanceChannelLatestMessageID(ctx, channelID, cursor)
 }
 
-func (s *Syncer) persistMessagePage(ctx context.Context, messages []*discordgo.Message, channelName string, fallbackGuildID string, embeddings bool) (string, error) {
+func (s *Syncer) persistMessagePage(ctx context.Context, messages []*discordgo.Message, channelName string, fallbackGuildID string, embeddings bool, observedAt time.Time) (string, error) {
 	if len(messages) == 0 {
 		return "", nil
+	}
+	if len(messages) > 0 && messages[0] != nil {
+		// Attachment extraction fetches content; recheck scope before it.
+		if err := s.requirePersistedScope(ctx, messages[0].ChannelID); err != nil {
+			return "", err
+		}
 	}
 	mutations, newest, err := buildMessageMutations(ctx, messages, channelName, fallbackGuildID, embeddings, s.attachmentTextEnabled)
 	if err != nil {
 		return "", err
+	}
+	for i := range mutations {
+		mutations[i].Options.PreserveNewer = true
+		mutations[i].Options.ObservationStartedAt = observedAt
+		if s.channelExclusions.configured() {
+			mutations[i].Options.ScopePolicy = s.channelExclusions.policyID()
+		}
 	}
 	if err := s.store.UpsertMessages(ctx, mutations); err != nil {
 		return "", err
@@ -1187,4 +1219,36 @@ func syncErrorOutcome(err error) string {
 		return "deferred_retryable"
 	}
 	return "skipped"
+}
+
+// attachmentScopeGuard returns the persisted-scope check used before every
+// attachment download, or nil when collection scope is not configured.
+func (s *Syncer) attachmentScopeGuard() func(context.Context, string) error {
+	if s == nil || s.store == nil {
+		return nil
+	}
+	return s.requirePersistedScope
+}
+
+// requirePersistedScope rejects a channel whose persisted collection scope is
+// no longer allowed under the configured policy, before any further content
+// request. A concurrent Gateway move can revoke scope during pagination.
+func (s *Syncer) requirePersistedScope(ctx context.Context, channelID string) error {
+	if s.store == nil || channelID == "" {
+		return nil
+	}
+	// Without configured exclusions only known channel/ancestor tombstones
+	// deny admission, matching the write-time guard.
+	policy := ""
+	if s.channelExclusions.configured() {
+		policy = s.channelExclusions.policyID()
+	}
+	allowed, err := s.store.ChannelCollectionAdmitted(ctx, channelID, policy)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return store.ErrCollectionScope
+	}
+	return nil
 }

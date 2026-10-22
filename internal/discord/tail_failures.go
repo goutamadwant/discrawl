@@ -3,8 +3,11 @@ package discord
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
+
+	"github.com/bwmarrin/discordgo"
 )
 
 type TailFailureStage string
@@ -31,12 +34,14 @@ const (
 )
 
 type TailFailure struct {
+	Code                string
 	EventType           string
 	Kind                string
 	GuildID             string
 	ChannelID           string
 	MessageID           string
 	UserID              string
+	ReceivedAt          time.Time
 	HandlerStage        TailFailureStage
 	HandlerStageElapsed time.Duration
 	HandlerElapsed      time.Duration
@@ -139,12 +144,14 @@ func newTailFailureFromExecution(task tailTask, execution tailTaskExecution) Tai
 		handlerStageElapsed = execution.handlerElapsed
 	}
 	return TailFailure{
+		Code:                SafeFailureCode(execution.err),
 		EventType:           task.eventType,
 		Kind:                tailFailureKind(execution.err),
 		GuildID:             guildID,
 		ChannelID:           channelID,
 		MessageID:           messageID,
 		UserID:              userID,
+		ReceivedAt:          task.receivedAt,
 		HandlerStage:        handlerStage,
 		HandlerStageElapsed: handlerStageElapsed,
 		HandlerElapsed:      execution.handlerElapsed,
@@ -152,6 +159,19 @@ func newTailFailureFromExecution(task tailTask, execution tailTaskExecution) Tai
 		JoinOutcome:         execution.joinOutcome,
 		ForceFallback:       execution.forceFallback,
 	}
+}
+
+// Preserve actionable provider diagnostics without response bodies, URLs or tokens.
+func SafeFailureCode(err error) string {
+	var rest *discordgo.RESTError
+	if errors.As(err, &rest) && rest.Response != nil {
+		code := fmt.Sprintf("http_%d", rest.Response.StatusCode)
+		if rest.Message != nil {
+			code += fmt.Sprintf("_discord_%d", rest.Message.Code)
+		}
+		return code
+	}
+	return ""
 }
 
 func tailFailureKind(err error) string {

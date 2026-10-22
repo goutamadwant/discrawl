@@ -14,6 +14,7 @@ import (
 )
 
 func (s *Syncer) RunTail(ctx context.Context, guildIDs []string, repairEvery time.Duration) error {
+	ctx = withAttachmentScopeGuard(ctx, s.attachmentScopeGuard())
 	if err := s.importTailMessageFailureFallbacks(ctx); err != nil {
 		return err
 	}
@@ -46,11 +47,11 @@ func (s *Syncer) RunTail(ctx context.Context, guildIDs []string, repairEvery tim
 			return nil
 		}
 	}
-	if repairEvery <= 0 && !s.tailRepairOnStart {
-		return s.client.Tail(ctx, handler)
-	}
 	tailCtx, cancelTail := context.WithCancel(ctx)
 	defer cancelTail()
+	textDone := make(chan struct{})
+	go func() { defer close(textDone); s.runTextRepair(tailCtx) }()
+	defer func() { cancelTail(); <-textDone }()
 	var closeOnce sync.Once
 	closeClient := func() {
 		if closeable, ok := s.client.(closeableClient); ok {
@@ -169,9 +170,11 @@ func (s *Syncer) startTailRepair(ctx context.Context, guildIDs []string) *tailRe
 
 func tailRepairSyncOptions(guildIDs []string, embeddings bool) SyncOptions {
 	return SyncOptions{
-		GuildIDs:     append([]string(nil), guildIDs...),
-		Embeddings:   embeddings,
-		SkipMembers:  true,
+		GuildIDs:   append([]string(nil), guildIDs...),
+		Embeddings: embeddings,
+		// The member lane has its own 24h successful-enumeration gate. Run it
+		// under this same writer owner rather than leaving it permanently idle.
+		SkipMembers:  false,
 		LatestOnly:   true,
 		RepairReason: "tail_repair",
 	}
@@ -181,7 +184,19 @@ func (s *Syncer) runTailRepair(ctx context.Context, opts SyncOptions) (SyncStats
 	if s.tailRepair != nil {
 		return s.tailRepair(ctx, opts)
 	}
-	return s.Sync(ctx, opts)
+	stats, syncErr := s.Sync(ctx, opts)
+	if ctx.Err() != nil {
+		return stats, errors.Join(syncErr, ctx.Err())
+	}
+	replayCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	_, replayErr := s.replayTailMessages(replayCtx, opts.GuildIDs, TailMessageReplayLimit, false)
+	metadataCtx, cancelMetadata := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelMetadata()
+	metadataErr := s.replayMetadataFailures(metadataCtx, opts.GuildIDs)
+	attachmentCtx, cancelAttachments := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelAttachments()
+	return stats, errors.Join(syncErr, replayErr, metadataErr, s.retryAttachmentText(attachmentCtx, opts.GuildIDs))
 }
 
 func (s *Syncer) joinTailRepair(repair *tailRepairRun, reason string) error {
@@ -246,6 +261,7 @@ type tailHandler struct {
 	exclusions            channelExclusions
 	exclusionMu           sync.RWMutex
 	channelScopeCatalog   map[string]store.ChannelRow
+	scopeCatalog          map[string]store.ChannelScope
 }
 
 func (t *tailHandler) OnTailReady(ctx context.Context) error {
@@ -262,6 +278,9 @@ func (t *tailHandler) OnTailFailure(failure discordclient.TailFailure) {
 	attrs := []any{
 		"event_type", failure.EventType,
 		"failure_kind", failure.Kind,
+	}
+	if failure.Code != "" {
+		attrs = append(attrs, "failure_code", failure.Code)
 	}
 	if failure.GuildID != "" {
 		attrs = append(attrs, "guild_id", failure.GuildID)
@@ -304,22 +323,25 @@ func (t *tailHandler) OnMessageCreate(ctx context.Context, msg *discordgo.Messag
 		t.logTailMessage("MESSAGE_CREATE", "ignored", "guild_scope", msg)
 		return nil
 	}
-	if t.excludeChannel(msg.ChannelID) {
+	allowed, scopeErr := t.allowMessageChannel(ctx, msg.GuildID, msg.ChannelID)
+	if scopeErr != nil {
+		return scopeErr
+	}
+	if !allowed {
 		t.logTailMessage("MESSAGE_CREATE", "ignored", "channel_scope", msg)
 		return nil
 	}
 	discordclient.UpdateTailFailureStage(ctx, discordclient.TailFailureStageMessageBuild)
 	mutation, err := buildMessageMutation(ctx, msg, "", "", t.enqueueEmbeddings, t.attachmentTextEnabled)
 	if err != nil {
-		return err
+		return t.scopeRejection(ctx, "MESSAGE_CREATE", "create", msg, err)
 	}
+	mutation.Options.ScopePolicy = t.scopePolicy()
+	mutation.Options.AppendEvent = true
+	mutation.EventType = "create"
 	discordclient.UpdateTailFailureStage(ctx, discordclient.TailFailureStageCanonicalWrite)
 	if err := t.store.UpsertMessages(ctx, []store.MessageMutation{mutation}); err != nil {
-		return err
-	}
-	discordclient.UpdateTailFailureStage(ctx, discordclient.TailFailureStageEventAppend)
-	if err := t.store.AppendMessageEvent(ctx, msg.GuildID, msg.ChannelID, msg.ID, "create", msg); err != nil {
-		return err
+		return t.scopeRejection(ctx, "MESSAGE_CREATE", "create", msg, err)
 	}
 	discordclient.UpdateTailFailureStage(ctx, discordclient.TailFailureStageStateUpdate)
 	if err := t.store.SetSyncState(ctx, "tail:last_event", msg.ID); err != nil {
@@ -353,10 +375,17 @@ func (t *tailHandler) OnMessageUpdate(ctx context.Context, msg *discordgo.Messag
 		t.logTailMessage("MESSAGE_UPDATE", "ignored", "guild_scope", msg)
 		return nil
 	}
-	if t.excludeChannel(msg.ChannelID) {
+	allowed, scopeErr := t.allowMessageChannel(ctx, msg.GuildID, msg.ChannelID)
+	if scopeErr != nil {
+		return scopeErr
+	}
+	if !allowed {
 		t.logTailMessage("MESSAGE_UPDATE", "ignored", "channel_scope", msg)
 		return nil
 	}
+	// Fence the canonical write against recovery snapshots stored after this
+	// observation started, including while a partial event is refetched.
+	observationStarted := time.Now()
 	var err error
 	msg, err = t.messageUpdateSnapshot(ctx, msg)
 	if err != nil {
@@ -377,15 +406,15 @@ func (t *tailHandler) OnMessageUpdate(ctx context.Context, msg *discordgo.Messag
 	discordclient.UpdateTailFailureStage(ctx, discordclient.TailFailureStageMessageBuild)
 	mutation, err := buildMessageMutation(ctx, msg, "", "", t.enqueueEmbeddings, t.attachmentTextEnabled)
 	if err != nil {
-		return err
+		return t.scopeRejection(ctx, "MESSAGE_UPDATE", "update", msg, err)
 	}
+	mutation.Options.ScopePolicy = t.scopePolicy()
+	mutation.Options.ObservationStartedAt = observationStarted
+	mutation.Options.AppendEvent = true
+	mutation.EventType = "update"
 	discordclient.UpdateTailFailureStage(ctx, discordclient.TailFailureStageCanonicalWrite)
 	if err := t.store.UpsertMessages(ctx, []store.MessageMutation{mutation}); err != nil {
-		return err
-	}
-	discordclient.UpdateTailFailureStage(ctx, discordclient.TailFailureStageEventAppend)
-	if err := t.store.AppendMessageEvent(ctx, msg.GuildID, msg.ChannelID, msg.ID, "update", msg); err != nil {
-		return err
+		return t.scopeRejection(ctx, "MESSAGE_UPDATE", "update", msg, err)
 	}
 	discordclient.UpdateTailFailureStage(ctx, discordclient.TailFailureStageStateUpdate)
 	if err := t.store.SetSyncState(ctx, "tail:last_event", msg.ID); err != nil {
@@ -493,6 +522,24 @@ func (t *tailHandler) OnMessageDelete(ctx context.Context, evt *discordgo.Messag
 	return nil
 }
 
+// scopeRejection turns a collection-scope revocation observed after admission
+// (by the attachment guard or the transactional write guard) into a policy
+// outcome: the event is ignored and pending work for it is resolved rather
+// than recorded as a retryable failure. Other errors pass through unchanged.
+func (t *tailHandler) scopeRejection(ctx context.Context, eventType, eventKind string, msg *discordgo.Message, err error) error {
+	if !errors.Is(err, store.ErrCollectionScope) || t.store == nil || msg == nil {
+		return err
+	}
+	ledgerCtx, cancel := failureLedgerContext(ctx)
+	defer cancel()
+	ref := tailMessageFailureIdentity(msg.GuildID, msg.ChannelID, msg.ID, eventKind)
+	if resolveErr := t.store.ResolveFailureWithReason(ledgerCtx, ref, "excluded_by_collection_policy"); resolveErr != nil {
+		return resolveErr
+	}
+	t.logTailMessage(eventType, "ignored", "channel_scope", msg)
+	return nil
+}
+
 func (t *tailHandler) logTailMessage(eventType, stage, reason string, msg *discordgo.Message) {
 	if msg == nil {
 		t.logTailEvent(eventType, stage, reason, "", "", "")
@@ -533,23 +580,39 @@ func (t *tailHandler) OnChannelUpsert(ctx context.Context, channel *discordgo.Ch
 	if channel == nil || !t.allowGuild(channel.GuildID) {
 		return nil
 	}
-	t.trackChannelExclusion(channel)
-	if t.excludeChannel(channel.ID) {
-		return nil
+	if err := t.store.UpsertChannel(ctx, toChannelRecord(channel, marshalJSONString(channel, "{}"))); err != nil {
+		return err
 	}
-	return t.store.UpsertChannel(ctx, toChannelRecord(channel, marshalJSONString(channel, "{}")))
+	return t.refreshScope(ctx)
 }
 
 func (t *tailHandler) OnGuildUpsert(ctx context.Context, guild *discordgo.Guild) error {
 	if guild == nil || guild.Unavailable || !t.allowGuild(guild.ID) {
 		return nil
 	}
-	return t.store.UpsertGuild(ctx, store.GuildRecord{
+	if err := t.store.UpsertGuild(ctx, store.GuildRecord{
 		ID:      guild.ID,
 		Name:    guild.Name,
 		Icon:    guild.Icon,
 		RawJSON: marshalJSONString(guild, "{}"),
-	})
+	}); err != nil {
+		return err
+	}
+	for _, c := range append(guild.Channels, guild.Threads...) {
+		if c == nil || c.ID == "" {
+			continue
+		}
+		if c.GuildID != "" && c.GuildID != guild.ID {
+			return errors.New("guild channel identity mismatch")
+		}
+		observed := *c
+		observed.GuildID = guild.ID
+		c = &observed
+		if err := t.store.UpsertChannel(ctx, toChannelRecord(c, marshalJSONString(c, "{}"))); err != nil {
+			return err
+		}
+	}
+	return t.refreshScope(ctx)
 }
 
 func (t *tailHandler) OnGuildDelete(ctx context.Context, guild *discordgo.Guild) error {
@@ -581,18 +644,7 @@ func (t *tailHandler) seedChannelExclusions(ctx context.Context) error {
 	if t.store == nil {
 		return nil
 	}
-	channels, err := t.store.Channels(ctx, "")
-	if err != nil {
-		return err
-	}
-	channelByID := make(map[string]store.ChannelRow, len(channels))
-	for _, channel := range channels {
-		channelByID[channel.ID] = channel
-	}
-	t.exclusionMu.Lock()
-	defer t.exclusionMu.Unlock()
-	t.channelScopeCatalog = channelByID
-	return nil
+	return t.seedScopeMetadata(ctx)
 }
 
 func (t *tailHandler) excludeChannel(channelID string) bool {

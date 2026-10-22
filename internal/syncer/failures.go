@@ -33,6 +33,16 @@ func (s *Syncer) recordChannelFailure(ctx context.Context, guildID, channelID st
 	}
 	ledgerCtx, cancel := failureLedgerContext(ctx)
 	defer cancel()
+	if errors.Is(failure, store.ErrCollectionScope) {
+		// Leaving collection scope is a policy outcome, not a retryable
+		// failure: resolve pending channel work instead of degrading status.
+		return s.store.ResolveFailureWithReason(ledgerCtx, store.FailureRef{
+			Operation: syncMessagesFailureOperation,
+			Source:    "discord",
+			GuildID:   guildID,
+			ChannelID: channelID,
+		}, "excluded_by_collection_policy")
+	}
 	return s.store.RecordFailure(ledgerCtx, store.FailureRef{
 		Operation: syncMessagesFailureOperation,
 		Source:    "discord",
@@ -76,11 +86,28 @@ func (t *tailHandler) RecordTailFailure(failure discordclient.TailFailure) error
 		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(failure.EventType)), "MESSAGE_") {
 			return errors.New("record tail message failure: unsupported event type")
 		}
-		return nil
+		if t == nil || t.store == nil {
+			return errors.New("metadata failure store unavailable")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), tailMessageFailureLedgerTimeout)
+		defer cancel()
+		cause := "metadata event handler failed"
+		if failure.Code != "" {
+			cause += " (" + failure.Code + ")"
+		}
+		ref := store.FailureRef{Operation: "tail_metadata", Source: "discord", GuildID: failure.GuildID, ChannelID: failure.ChannelID, RelatedKind: "gateway_event", RelatedID: failure.EventType + ":" + failure.UserID}
+		if failure.EventType == "GUILD_MEMBER_REMOVE" {
+			// Removal replay compares the member against this event's time.
+			return t.store.RecordEventFailure(ctx, ref, errors.New(cause), failure.ReceivedAt)
+		}
+		return t.store.RecordFailure(ctx, ref, errors.New(cause))
 	}
 	failureKind, durableFailure, ok := tailMessageFailureSentinel(failure.Kind)
 	if !ok {
 		return errors.New("record tail message failure: unsupported failure kind")
+	}
+	if failure.Code != "" {
+		durableFailure = fmt.Errorf("%w (%s)", durableFailure, failure.Code)
 	}
 	if failure.MessageID == "" {
 		return errors.New("record tail message failure: missing message id")

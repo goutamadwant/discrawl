@@ -1028,6 +1028,21 @@ func (s *Store) GuildMemberCount(ctx context.Context, guildID string) (int, erro
 
 func (s *Store) Status(ctx context.Context, dbPath, defaultGuildID string) (Status, error) {
 	status := Status{DBPath: dbPath, DefaultGuildID: defaultGuildID}
+	var repairErr error
+	status.TextRepair, repairErr = s.TextRepairStatus(ctx)
+	if repairErr != nil {
+		return Status{}, repairErr
+	}
+	var oldest string
+	if err := s.db.QueryRowContext(ctx, `select count(*),coalesce(min(first_seen_at),'') from failure_ledger where resolved_at is null`).Scan(&status.UnresolvedFailures, &oldest); err != nil {
+		return Status{}, err
+	}
+	status.OldestFailureAt = parseTime(oldest)
+	// Count only actionable failures: a deleted message or a channel that left
+	// collection scope keeps its historical receipt but is no longer retried.
+	if err := s.db.QueryRowContext(ctx, `select count(*) from message_attachments a join messages m on m.id=a.message_id join channels c on c.id=m.channel_id where a.text_status='failed' and m.deleted_at is null and c.collection_scope='allowed'`).Scan(&status.AttachmentTextFailures); err != nil {
+		return Status{}, err
+	}
 	guildCount, err := s.q.CountGuilds(ctx)
 	if err != nil {
 		return Status{}, err

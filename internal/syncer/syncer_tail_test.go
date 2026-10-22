@@ -2,6 +2,7 @@ package syncer
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -322,7 +323,9 @@ func TestTailHandlerMessageUpdateFailureUsesSyncerRefetchedMetadata(t *testing.T
 				var err error
 				tailStore, err = store.Open(ctx, filepath.Join(t.TempDir(), "discrawl.db"))
 				require.NoError(t, err)
-				require.NoError(t, tailStore.Close())
+				// Fail the store after the admission check and refetch, so the
+				// canonical write is the failing stage.
+				onFetch = func(context.Context) { require.NoError(t, tailStore.Close()) }
 			case "panic":
 				var err error
 				tailStore, err = store.Open(ctx, filepath.Join(t.TempDir(), "discrawl.db"))
@@ -334,14 +337,22 @@ func TestTailHandlerMessageUpdateFailureUsesSyncerRefetchedMetadata(t *testing.T
 				require.NoError(t, err)
 				t.Cleanup(func() { _ = tailStore.Close() })
 				tailStore.DB().SetMaxOpenConns(1)
-				heldConn, err := tailStore.DB().Conn(ctx)
-				require.NoError(t, err)
+				// Hold the only connection from the refetch onward, after the
+				// admission check, so the canonical write times out.
+				var heldConn *sql.Conn
 				var releaseOnce sync.Once
 				release := func() {
-					releaseOnce.Do(func() { _ = heldConn.Close() })
+					releaseOnce.Do(func() {
+						if heldConn != nil {
+							_ = heldConn.Close()
+						}
+					})
 				}
 				t.Cleanup(release)
 				onFetch = func(taskCtx context.Context) {
+					conn, err := tailStore.DB().Conn(ctx)
+					require.NoError(t, err)
+					heldConn = conn
 					go func() {
 						<-taskCtx.Done()
 						time.Sleep(10 * time.Millisecond)
@@ -373,7 +384,13 @@ func TestTailHandlerMessageUpdateFailureUsesSyncerRefetchedMetadata(t *testing.T
 			eventClient, err := discordclient.New("token")
 			require.NoError(t, err)
 			defer func() { _ = eventClient.Close() }()
-			setDiscordTailHandlerTimeout(t, eventClient, 25*time.Millisecond)
+			// Only the timeout case needs a short handler deadline; the other
+			// cases must not race it under a loaded race-detector run.
+			handlerTimeout := 2 * time.Second
+			if tt.wantKind == "timeout" {
+				handlerTimeout = 25 * time.Millisecond
+			}
+			setDiscordTailHandlerTimeout(t, eventClient, handlerTimeout)
 
 			ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
@@ -726,7 +743,10 @@ func TestPanickedGatewayMessageReplaysExactlyWithoutTailSideEffects(t *testing.T
 	require.NoError(t, err)
 	require.Equal(t, "999", lastEvent)
 	require.NoError(t, s.DB().QueryRowContext(replayCtx, `select count(*) from message_events`).Scan(&eventCount))
-	require.Zero(t, eventCount)
+	require.Equal(t, 1, eventCount)
+	var recoveredKind string
+	require.NoError(t, s.DB().QueryRowContext(replayCtx, `select event_type from message_events limit 1`).Scan(&recoveredKind))
+	require.Equal(t, "snapshot", recoveredKind)
 
 	report, err = s.ListFailures(replayCtx, store.FailureListOptions{IncludeResolved: true}, time.Now())
 	require.NoError(t, err)
@@ -795,7 +815,10 @@ func TestReplayTailMessageFailuresRecoversBelowCursorWithoutTailSideEffects(t *t
 	require.Equal(t, "999", lastEvent)
 	var eventCount int
 	require.NoError(t, s.DB().QueryRowContext(ctx, `select count(*) from message_events`).Scan(&eventCount))
-	require.Zero(t, eventCount)
+	require.Equal(t, 1, eventCount)
+	var recoveredKind string
+	require.NoError(t, s.DB().QueryRowContext(ctx, `select event_type from message_events limit 1`).Scan(&recoveredKind))
+	require.Equal(t, "snapshot", recoveredKind)
 
 	report, err := s.ListFailures(ctx, store.FailureListOptions{}, time.Now())
 	require.NoError(t, err)
@@ -1037,7 +1060,7 @@ func TestPersistMessagePageResolvesCreateButLeavesNewerUpdateFailure(t *testing.
 		Content:   "normal page recovery",
 		Timestamp: time.Now().UTC(),
 		Author:    &discordgo.User{ID: "u1", Username: "user"},
-	}}, "general", "g1", false)
+	}}, "general", "g1", false, time.Now())
 	require.NoError(t, err)
 	require.Equal(t, "40", newest)
 
@@ -1774,6 +1797,8 @@ func TestTailEventTraceLogsSafeStagesAndScopeOutcomes(t *testing.T) {
 		logger:     logger,
 		exclusions: newChannelScope([]string{"blocked"}, nil, nil),
 	}
+	require.NoError(t, handler.OnChannelUpsert(ctx, &discordgo.Channel{ID: "c1", GuildID: "g1", Type: discordgo.ChannelTypeGuildText}))
+
 	message := &discordgo.Message{
 		ID:        "100000000000000001",
 		GuildID:   "g1",

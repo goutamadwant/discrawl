@@ -9,22 +9,39 @@ import (
 
 	"github.com/openclaw/crawlkit/embed"
 	"github.com/openclaw/discrawl/internal/config"
+	"github.com/openclaw/discrawl/internal/inferencemetrics"
 )
 
 func newEmbeddingProvider(cfg config.EmbeddingsConfig) (embed.Provider, error) {
+	providerConfig := crawlkitEmbeddingConfig(cfg)
+	observer := inferencemetrics.FromEnvironment(providerConfig)
+	var opts []embed.Option
+	if observer != nil {
+		opts = append(opts, observer.Option())
+	}
 	switch strings.ToLower(strings.TrimSpace(cfg.APIKeySource)) {
 	case "", "env":
 		// Preserve Crawlkit's provider-specific optional/required env behavior.
-		return embed.NewProvider(crawlkitEmbeddingConfig(cfg))
 	case "keyring":
 		key, err := config.ResolveEmbeddingKeyringAPIKey(cfg)
 		if err != nil {
 			return nil, err
 		}
-		return embed.NewProvider(crawlkitEmbeddingConfig(cfg), embed.WithAPIKey(key))
+		opts = append(opts, embed.WithAPIKey(key))
+	case "file":
+		key, err := config.ResolveEmbeddingFileAPIKey(cfg)
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts, embed.WithAPIKey(key))
 	default:
-		return nil, errors.New("unsupported embedding api_key_source; use env or keyring")
+		return nil, errors.New("unsupported embedding api_key_source; use env, keyring or file")
 	}
+	provider, err := embed.NewProvider(providerConfig, opts...)
+	if err != nil || observer == nil {
+		return provider, err
+	}
+	return observer.Wrap(provider), nil
 }
 
 func checkEmbeddingProvider(ctx context.Context, cfg config.EmbeddingsConfig) embed.CheckResult {
